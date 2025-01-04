@@ -99,9 +99,6 @@ function run() {
     // Extract main domain for WHOIS lookup
     $main_domain = extractMainDomain($domain);
     
-    $zone = new Zone( $domain ."." );
-    $zone->setDefaultTtl(3600);
-
     $bash_ip_lookup = <<<EOT
 for ip in $( dig $domain +short ); do
     echo "Details on \$ip"
@@ -109,32 +106,51 @@ for ip in $( dig $domain +short ); do
 done
 EOT;
 
-    // Use main domain for WHOIS lookup
-    $whois = shell_exec( "whois $main_domain | grep -E 'Name Server|Registrar:|Domain Name:|Updated Date:|Creation Date:|Registrar IANA ID:Domain Status:|Reseller:'" );
-    $whois = empty( $whois ) ? "" : trim( $whois );
-
-    if ( empty( $whois ) ) {
+    // Use main domain for WHOIS lookup with more flexible pattern matching
+    $whois = shell_exec("whois $main_domain");
+    if (empty($whois)) {
         $errors[] = "Domain not found.";
-        echo json_encode( [
+        echo json_encode([
             "errors" => $errors,
-        ] );
+        ]);
         die();
     }
 
-    $whois = explode( "\n", $whois );
-    foreach( $whois as $key => $record ) {
-        $split  = explode( ":", trim( $record ) );
-        $name   = trim( $split[0] );
-        $value  = trim( $split[1] );
-        if ( $name == "Name Server" || $name == "Domain Name"  ) {
-            $value = strtolower( $value );
+    // Define patterns to match common WHOIS fields
+    $patterns = [
+        'Name Server' => '/Name Server:?\s*([^\n]+)/i',
+        'Registrar' => '/Registrar:?\s*([^\n]+)/i',
+        'Domain Name' => '/Domain Name:?\s*([^\n]+)/i',
+        'Updated Date' => '/Updated Date:?\s*([^\n]+)/i',
+        'Creation Date' => '/Creation Date:?\s*([^\n]+)/i',
+        'Registrar IANA ID' => '/Registrar IANA ID:?\s*([^\n]+)/i',
+        'Domain Status' => '/Domain Status:?\s*([^\n]+)/i',
+        'Reseller' => '/Reseller:?\s*([^\n]+)/i'
+    ];
+
+    $whois_results = [];
+    foreach ($patterns as $field => $pattern) {
+        if (preg_match_all($pattern, $whois, $matches)) {
+            foreach ($matches[1] as $value) {
+                $value = trim($value);
+                if ($field == "Name Server" || $field == "Domain Name") {
+                    $value = strtolower($value);
+                }
+                $whois_results[] = [
+                    "name" => $field,
+                    "value" => $value
+                ];
+            }
         }
-        $whois[ $key ] = [ "name" => $name, "value" => $value ];
     }
-    $whois     = array_map("unserialize", array_unique(array_map("serialize", $whois)));
-    $col_name  = array_column($whois, 'name');
-    $col_value = array_column($whois, 'value');
-    array_multisort($col_name, SORT_ASC, $col_value, SORT_ASC, $whois);
+
+    // Remove duplicates and sort
+    $whois_results = array_map("unserialize", array_unique(array_map("serialize", $whois_results)));
+    $col_name = array_column($whois_results, 'name');
+    $col_value = array_column($whois_results, 'value');
+    array_multisort($col_name, SORT_ASC, $col_value, SORT_ASC, $whois_results);
+
+    $whois = $whois_results;
 
     // Use full domain (including subdomain) for all other lookups
     $ips      = explode( "\n", trim( shell_exec( "dig $domain +short" ) ) );
