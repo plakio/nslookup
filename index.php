@@ -8,8 +8,11 @@ use Badcow\DNS\ResourceRecord;
 use Badcow\DNS\AlignedBuilder;
 error_reporting(E_ALL & ~E_DEPRECATED);
 
+/**
+ * Si el contenido del registro TXT supera los 500 caracteres,
+ * lo divide en trozos de 500 para cumplir con la sintaxis correcta.
+ */
 function specialTxtFormatter(Badcow\DNS\Rdata\TXT $rdata, int $padding): string {
-    //If the text length is less than or equal to 50 characters, just return it unaltered.
     if (strlen($rdata->getText()) <= 500) {
         return sprintf('"%s"', addcslashes($rdata->getText(), '"\\'));
     }
@@ -26,8 +29,27 @@ function specialTxtFormatter(Badcow\DNS\Rdata\TXT $rdata, int $padding): string 
     return $returnVal;
 }
 
+/**
+ * Extrae el dominio principal de un subdominio.
+ * sub.example.com => example.com
+ * example.com     => example.com
+ */
+function extractDomain($subdomain) {
+    $parts = explode('.', $subdomain);
+    $count = count($parts);
+
+    // Si tiene más de 2 partes, asumimos que las 2 últimas forman el dominio principal
+    if ($count > 2) {
+        return implode('.', array_slice($parts, $count - 2));
+    }
+
+    // Si solo tiene 2 partes, ya es un dominio principal
+    return $subdomain;
+}
+
 function run() {
 
+    // Verifica si se recibió algún dominio por parámetro
     if ( ! isset( $_REQUEST['domain'] ) ) {
         return;
     }
@@ -38,6 +60,7 @@ function run() {
     $dns_records   = [];
     $required_bins = [ "whois", "dig", "host" ];
 
+    // Comprueba que existan los comandos externos necesarios
     foreach ($required_bins as $bin) {
         $output     = null;
         $return_var = null;
@@ -47,6 +70,7 @@ function run() {
         }
     }
 
+    // Validaciones básicas del dominio
     if ( ! filter_var( $domain, FILTER_VALIDATE_DOMAIN ) ) {
         $errors[] = "Invalid domain.";
     }
@@ -70,19 +94,20 @@ function run() {
         die();
     }
 
+    // Crea la zona DNS con TTL por defecto
     $zone = new Zone( $domain ."." );
     $zone->setDefaultTtl(3600);
 
-    $bash_ip_lookup = <<<EOT
-for ip in $( dig $domain +short ); do
-    echo "Details on \$ip"
-    whois \$ip | grep -E 'NetName:|Organization:|OrgName:'
-done
-EOT;
+    // --------------------------------
+    // WHOIS: Ahora extraemos el dominio principal para la consulta
+    // --------------------------------
+    $whois_domain = extractDomain($domain);
 
-    $whois = shell_exec( "whois $domain | grep -E 'Name Server|Registrar:|Domain Name:|Updated Date:|Creation Date:|Registrar IANA ID:Domain Status:|Reseller:'" );
+    // Ejecución de WHOIS con el dominio principal
+    $whois = shell_exec( "whois $whois_domain | grep -E 'Name Server|Registrar:|Domain Name:|Updated Date:|Creation Date:|Registrar IANA ID:|Domain Status:|Reseller:'" );
     $whois = empty( $whois ) ? "" : trim( $whois );
 
+    // Si WHOIS no devuelve nada, asumimos que el dominio no existe
     if ( empty( $whois ) ) {
         $errors[] = "Domain not found.";
         echo json_encode( [
@@ -91,21 +116,28 @@ EOT;
         die();
     }
 
+    // Procesa la salida WHOIS en un formato más manejable
     $whois = explode( "\n", $whois );
     foreach( $whois as $key => $record ) {
         $split  = explode( ":", trim( $record ) );
         $name   = trim( $split[0] );
-        $value  = trim( $split[1] );
+        $value  = trim( $split[1] ?? '' );
         if ( $name == "Name Server" || $name == "Domain Name"  ) {
             $value = strtolower( $value );
         }
         $whois[ $key ] = [ "name" => $name, "value" => $value ];
     }
+
+    // Elimina duplicados y ordena alfabéticamente
     $whois     = array_map("unserialize", array_unique(array_map("serialize", $whois)));
     $col_name  = array_column($whois, 'name');
     $col_value = array_column($whois, 'value');
     array_multisort($col_name, SORT_ASC, $col_value, SORT_ASC, $whois);
-    $ips      = explode( "\n", trim( shell_exec( "dig $domain +short" ) ) );
+
+    // --------------------------------
+    // Información de IP
+    // --------------------------------
+    $ips = explode( "\n", trim( shell_exec( "dig $domain +short" ) ) );
     foreach ( $ips as $ip ) {
         if ( empty( $ip ) ) {
             continue;
@@ -115,8 +147,13 @@ EOT;
         $ip_lookup[ "$ip" ] = $response;
     }
 
+    // --------------------------------
+    // Preparación para registros wildcard
+    // --------------------------------
     $wildcard_cname   = "";
     $wildcard_a       = "";
+
+    // Lista de registros DNS a consultar
     $records_to_check = [
         [ "a"     => "" ],
         [ "a"     => "*" ],
@@ -163,6 +200,7 @@ EOT;
         [ "soa"   => "" ],
     ];
 
+    // Bucle para consultar registros DNS
     foreach( $records_to_check as $record ) {
         $pre  = "";
         $type = key( $record );
@@ -170,23 +208,40 @@ EOT;
         if ( ! empty( $name ) ) {
             $pre = "{$name}.";
         }
+
+        // Verifica si el registro es un alias, si no lo es, usa 'dig'
         $value = shell_exec( "(host -t $type $pre$domain | grep -q 'is an alias for') && echo \"\" || dig $pre$domain $type +short | sort -n" );
+
+        // Para CNAME, obtiene la parte 'alias for'
         if ( $type == "cname" ) {
             $value = shell_exec( "host -t $type $pre$domain | grep 'alias for' | awk '{print \$NF}'" );
         }
+
         $value = empty( $value ) ? "" : trim( $value );
         if ( empty( $value ) ) {
             continue;
         }
+
+        // Manejo especial de SOA
         if ( $type == "soa" ) {
             $record_value = explode( " ", $value );
             $setName = empty( $name ) ? "@" : $name;
             $record  = new ResourceRecord;
             $record->setName( $setName );
-            $record->setRdata(Factory::Soa($record_value[0],$record_value[1],$record_value[2],$record_value[3],$record_value[4],$record_value[5],$record_value[6]));
+            $record->setRdata(Factory::Soa(
+                $record_value[0],
+                $record_value[1],
+                $record_value[2],
+                $record_value[3],
+                $record_value[4],
+                $record_value[5],
+                $record_value[6]
+            ));
             $zone->addResourceRecord($record);
             continue;
         }
+
+        // Manejo especial de NS
         if ( $type == "ns" ) {
             $record_values = explode( "\n", $value );
             foreach( $record_values as  $record_value ) {
@@ -196,9 +251,11 @@ EOT;
                 $record->setRdata(Factory::Ns($record_value));
                 $zone->addResourceRecord($record);
             }
+            continue;
         }
-        // Verify A record is not a CNAME record
-        if(  $type == "a" && preg_match("/[a-z]/i", $value)){
+
+        // Si es un registro A y resultó ser un texto, asumimos que en realidad es un CNAME
+        if( $type == "a" && preg_match("/[a-z]/i", $value) ){
             $type  = "cname";
             $value = shell_exec( "dig $pre$domain $type +short | sort -n" );
             $value = empty( $value ) ? "" : trim( $value );
@@ -206,6 +263,8 @@ EOT;
                 continue;
             }
         }
+
+        // Manejo del tipo A (direcciones IP)
         if ( $type == "a" ) {
             if ( ! empty( $wildcard_a ) && $wildcard_a == $record_values ) {
                 continue;
@@ -222,6 +281,8 @@ EOT;
                 $zone->addResourceRecord($record);
             }
         }
+
+        // Manejo del tipo CNAME
         if ( $type == "cname" ) {
             if ( $name == "*" ) {
                 $wildcard_cname = $value;
@@ -236,20 +297,30 @@ EOT;
             $record->setRdata(Factory::Cname($value));
             $zone->addResourceRecord($record);
         }
+
+        // Manejo del tipo SRV
         if ( $type == "srv" ) {
             $record_values = explode( " ", $value );
-            if ( count ( $record_values ) != "4" ) {
+            if ( count($record_values) != 4 ) {
                 continue;
             }
             $setName = empty( $name ) ? "@" : $name;
             $record  = new ResourceRecord;
             $record->setName( $setName );
-            $record->setRdata(Factory::Srv($record_values[0], $record_values[1], $record_values[2], $record_values[3]));
+            $record->setRdata(Factory::Srv(
+                $record_values[0],
+                $record_values[1],
+                $record_values[2],
+                $record_values[3]
+            ));
             $zone->addResourceRecord($record);
         }
+
+        // Manejo de MX
         if ( $type == "mx" ) {
             $setName       = empty( $name ) ? "@" : $name;
             $record_values = explode( "\n", $value );
+            // Ordena por prioridad
             usort($record_values, function ($a, $b) {
                 $a_value = explode( " ", $a );
                 $b_value = explode( " ", $b );
@@ -257,7 +328,7 @@ EOT;
             });
             foreach( $record_values as $record_value ) {
                 $record_value = explode( " ", $record_value );
-                if ( count( $record_value ) != "2" ) {
+                if ( count( $record_value ) != 2 ) {
                     continue;
                 }
                 $mx_priority  = $record_value[0];
@@ -268,6 +339,8 @@ EOT;
                 $zone->addResourceRecord($record);
             }
         }
+
+        // Manejo de TXT
         if ( $type == "txt" ) {
             $record_values = explode( "\n", $value );
             $setName       = empty( $name ) ? "@" : "$name";
@@ -279,20 +352,22 @@ EOT;
                 $zone->addResourceRecord($record);
             }
         }
+
+        // Agrega la info al arreglo final de registros DNS
         $dns_records[] = [ "type" => $type, "name" => $name, "value" => $value ];
     }
 
+    // --------------------------------
+    // Encabezados HTTP
+    // --------------------------------
     $response = shell_exec( "curl -sLI $domain | awk 'BEGIN{RS=\"\\r\\n\\r\\n\"}; END{print}'" );
     $lines    = explode("\n", trim( $response ) );
     $http_headers = [];
     foreach ($lines as $line) {
-        // Trim whitespace from each line
         $line = trim($line);
-        // Match key-value pairs (lines with a colon)
         if (preg_match('/^([^:]+):\s*(.*)$/', $line, $matches)) {
-            $key = strtolower($matches[1]); // Use lowercase keys for consistency
+            $key = strtolower($matches[1]);
             $value = $matches[2];
-            // Handle duplicate keys (e.g., "vary" appears twice)
             if (isset($http_headers[$key])) {
                 if (is_array($http_headers[$key])) {
                     $http_headers[$key][] = $value;
@@ -305,23 +380,26 @@ EOT;
         }
     }
 
-  $builder = new AlignedBuilder();
-  $builder->addRdataFormatter('TXT', 'specialTxtFormatter');
+    // Construye la zona usando AlignedBuilder
+    $builder = new AlignedBuilder();
+    $builder->addRdataFormatter('TXT', 'specialTxtFormatter');
 
-  echo json_encode( [
-    "whois"        => $whois,
-    "http_headers" => $http_headers,
-    "dns_records"  => $dns_records,
-    "ip_lookup"    => $ip_lookup,
-    "errors"       => [],
-    "zone"         => $builder->build($zone)
-  ]);
-  die();
+    // Respuesta final en JSON
+    echo json_encode( [
+        "whois"        => $whois,
+        "http_headers" => $http_headers,
+        "dns_records"  => $dns_records,
+        "ip_lookup"    => $ip_lookup,
+        "errors"       => [],
+        "zone"         => $builder->build($zone)
+    ]);
+    die();
 }
 
 run();
 
-?><!DOCTYPE html>
+?>
+<!DOCTYPE html>
 <html>
 <head>
     <title>WHOIS and NS Lookup</title>
@@ -353,7 +431,9 @@ run();
             <template v-slot:append-inner>
                 <v-btn variant="flat" color="primary" @click="lookupDomain()" :loading="loading">
                     Lookup
-                    <template v-slot:loader><v-progress-circular :size="22" :width="2" color="white" indeterminate></v-progress-circular></template>
+                    <template v-slot:loader>
+                        <v-progress-circular :size="22" :width="2" color="white" indeterminate></v-progress-circular>
+                    </template>
                 </v-btn>
             </template>
             </v-text-field>
@@ -368,12 +448,8 @@ run();
                 <template v-slot:default>
                 <thead>
                     <tr>
-                    <th class="text-left">
-                        Name
-                    </th>
-                    <th class="text-left">
-                        Value
-                    </th>
+                    <th class="text-left">Name</th>
+                    <th class="text-left">Value</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -385,7 +461,6 @@ run();
                 </template>
                 </v-table>
                 </v-card-text>
-                </v-card>
             </v-card>
             <v-card class="mt-5" variant="outlined" color="primary">
                 <v-card-title>IP information</v-card-title>
@@ -396,12 +471,8 @@ run();
                     <template v-slot:default>
                     <thead>
                         <tr>
-                        <th class="text-left">
-                            Name
-                        </th>
-                        <th class="text-left">
-                            Value
-                        </th>
+                        <th class="text-left">Name</th>
+                        <th class="text-left">Value</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -414,7 +485,6 @@ run();
                     </v-table>
                     </template>
                 </v-card-text>
-                </v-card>
             </v-card>
             <v-card class="mt-5" variant="outlined" color="primary">
                 <v-card-title>HTTP headers</v-card-title>
@@ -423,12 +493,8 @@ run();
                     <template v-slot:default>
                     <thead>
                         <tr>
-                        <th class="text-left" style="min-width: 200px;">
-                            Name
-                        </th>
-                        <th class="text-left">
-                            Value
-                        </th>
+                        <th class="text-left" style="min-width: 200px;">Name</th>
+                        <th class="text-left">Value</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -440,7 +506,6 @@ run();
                     </template>
                     </v-table>
                 </v-card-text>
-                </v-card>
             </v-card>
             </v-col>
             <v-col md="7" cols="12">
@@ -451,15 +516,9 @@ run();
                 <template v-slot:default>
                 <thead>
                     <tr>
-                    <th class="text-left">
-                        Type
-                    </th>
-                    <th class="text-left">
-                        Name
-                    </th>
-                    <th class="text-left">
-                        Value
-                    </th>
+                    <th class="text-left">Type</th>
+                    <th class="text-left">Name</th>
+                    <th class="text-left">Value</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -472,7 +531,6 @@ run();
                 </template>
                 </v-table>
                 </v-card-text>
-                </v-card>
             </v-card>
             <v-card class="mt-5" variant="flat">
                 <v-btn size="small" @click="copyZone()" class="position-absolute right-0 mt-6" style="margin-right: 140px;">
@@ -482,7 +540,9 @@ run();
                   <v-icon left>mdi-download</v-icon>
                   Download
                 </v-btn>
-                <pre class="language-dns-zone-file text-body-2" style="border-radius:4px;border:0px"><code class="language-dns-zone-file">{{ response.zone }}</code></pre>
+                <pre class="language-dns-zone-file text-body-2" style="border-radius:4px;border:0px">
+                    <code class="language-dns-zone-file">{{ response.zone }}</code>
+                </pre>
                 <a ref="download_zone" href="#"></a>
             </v-card>
             </v-col>
@@ -519,8 +579,9 @@ run();
         methods: {
             lookupDomain() {
                 this.loading = true
-                this.domain = this.extractHostname( this.domain )
-                fetch( "?domain=" + this.domain )
+                // El frontend limpia la URL y extrae únicamente el host
+                this.domain = this.extractHostname(this.domain)
+                fetch("?domain=" + this.domain)
                     .then( response => response.json() )
                     .then( data => {
                         this.loading = false
@@ -530,31 +591,25 @@ run();
                         Prism.highlightAll()
                     })
             },
-            extractHostname( url ) {
-                var hostname;
-                //find & remove protocol (http, ftp, etc.) and get hostname
-
+            extractHostname(url) {
+                let hostname;
                 if (url.indexOf("//") > -1) {
                     hostname = url.split('/')[2];
                 } else {
                     hostname = url.split('/')[0];
                 }
-
-                //find & remove port number
                 hostname = hostname.split(':')[0];
-                //find & remove "?"
                 hostname = hostname.split('?')[0];
-
                 return hostname;
             },
             downloadZone() {
-                newBlob = new Blob([this.response.zone], {type: "text/dns"})
+                let newBlob = new Blob([this.response.zone], {type: "text/dns"})
                 this.$refs.download_zone.download = `${this.domain}.zone`;
                 this.$refs.download_zone.href = window.URL.createObjectURL(newBlob);
                 this.$refs.download_zone.click();
             },
             copyZone() {
-                navigator.clipboard.writeText( this.response.zone )
+                navigator.clipboard.writeText(this.response.zone)
                 this.snackbar.message = "Zone copied to clipboard"
                 this.snackbar.show = true
             }
