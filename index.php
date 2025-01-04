@@ -405,7 +405,7 @@ run();
 <!DOCTYPE html>
 <html>
 <head>
-    <title>WHOIS and NS Lookup</title>
+    <title>WHOIS Lookup</title>
     <link href="prism.css" rel="stylesheet" />
     <link href="https://fonts.googleapis.com/css?family=Roboto:100,300,400,500,700,900" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/css/materialdesignicons.min.css" rel="stylesheet">
