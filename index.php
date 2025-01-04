@@ -58,27 +58,28 @@ function run() {
         return;
     }
 
-    $domain        = $_REQUEST['domain'];
-    $errors        = [];
-    $ip_lookup     = [];
-    $dns_records   = [];
-    $required_bins = [ "whois", "dig", "host" ];
+    $domain = $_REQUEST['domain'];
+    $errors = [];
+    $ip_lookup = [];
+    $dns_records = [];
+    $whois = []; // Initialize empty whois array
+    $required_bins = ["whois", "dig", "host"];
 
     foreach ($required_bins as $bin) {
-        $output     = null;
+        $output = null;
         $return_var = null;
-        exec( "command -v $bin", $output, $return_var );
+        exec("command -v $bin", $output, $return_var);
         if ($return_var != 0) {
             $errors[] = "Required command \"$bin\" is not installed.";
         }
     }
 
-    if ( ! filter_var( $domain, FILTER_VALIDATE_DOMAIN ) ) {
-        $errors[] = "Invalid domain.";
+    if (!filter_var($domain, FILTER_VALIDATE_DOMAIN)) {
+        $errors[] = "Invalid domain format.";
     }
     
-    if ( filter_var( $domain, FILTER_VALIDATE_DOMAIN ) && strpos( $domain, '.') === false ) {
-        $errors[] = "Invalid domain.";
+    if (filter_var($domain, FILTER_VALIDATE_DOMAIN) && strpos($domain, '.') === false) {
+        $errors[] = "Invalid domain format.";
     }
 
     if (strlen($domain) < 4) {
@@ -89,34 +90,41 @@ function run() {
         $errors[] = "Too long.";
     }
 
-    if ( count( $errors ) > 0 ) {
-        echo json_encode( [
+    // If we have validation errors, return them early
+    if (count($errors) > 0) {
+        echo json_encode([
             "errors" => $errors,
-        ] );
+        ]);
         die();
+    }
+
+    // Check if domain exists in DNS before proceeding
+    $dns_check = shell_exec("dig $domain ANY +short");
+    if (empty(trim($dns_check))) {
+        $dns_check = shell_exec("dig $domain +short");  // Try again without ANY
+    }
+    
+    // If still no DNS records found, try one more check for MX or TXT records
+    if (empty(trim($dns_check))) {
+        $mx_check = shell_exec("dig $domain MX +short");
+        $txt_check = shell_exec("dig $domain TXT +short");
+        if (empty(trim($mx_check)) && empty(trim($txt_check))) {
+            $errors[] = "No DNS records found for this domain.";
+            echo json_encode([
+                "errors" => $errors,
+            ]);
+            die();
+        }
     }
 
     // Extract main domain for WHOIS lookup
     $main_domain = extractMainDomain($domain);
-    $is_subdomain = ($main_domain !== $domain);
     
-    $bash_ip_lookup = <<<EOT
-for ip in $( dig $domain +short ); do
-    echo "Details on \$ip"
-    whois \$ip | grep -E 'NetName:|Organization:|OrgName:'
-done
-EOT;
-
-    // Initialize whois array
-    $whois = [];
-
-    // Only perform WHOIS lookup if it's not a subdomain
-    if (!$is_subdomain) {
-        // Use main domain for WHOIS lookup with more flexible pattern matching
+    // Only do WHOIS lookup if it's the main domain
+    if ($domain === $main_domain) {
         $whois_output = shell_exec("whois $main_domain");
-        
         if (!empty($whois_output)) {
-            // Define patterns to match common WHOIS fields
+            // Process WHOIS data as before
             $patterns = [
                 'Name Server' => '/Name Server:?\s*([^\n]+)/i',
                 'Registrar' => '/Registrar:?\s*([^\n]+)/i',
@@ -143,11 +151,12 @@ EOT;
                 }
             }
 
-            // Remove duplicates and sort
-            $whois = array_map("unserialize", array_unique(array_map("serialize", $whois)));
-            $col_name = array_column($whois, 'name');
-            $col_value = array_column($whois, 'value');
-            array_multisort($col_name, SORT_ASC, $col_value, SORT_ASC, $whois);
+            if (!empty($whois)) {
+                $whois = array_map("unserialize", array_unique(array_map("serialize", $whois)));
+                $col_name = array_column($whois, 'name');
+                $col_value = array_column($whois, 'value');
+                array_multisort($col_name, SORT_ASC, $col_value, SORT_ASC, $whois);
+            }
         }
     }
 
