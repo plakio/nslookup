@@ -43,7 +43,7 @@ function parseDomain(string $fullDomain): array
 {
     // Lista de TLDs (o ccTLDs) de 2 niveles que quieres soportar
     $twoLevelTlds = [
-        'co.uk', 'com.ar', 'com.br', 'com.mx', 'com.pe', 'co.pe', 'net.pe', 'org.pe', // Agrega más si lo requieres
+        'co.uk', 'com.ar', 'com.br', 'com.mx', 'com.pe', 'co.pe', 'net.pe', 'org.pe',
     ];
 
     $fullDomain = strtolower($fullDomain);
@@ -59,10 +59,8 @@ function parseDomain(string $fullDomain): array
     }
 
     // Revisamos si el dominio completo termina con alguno de los TLDs de 2 niveles.
-    // Ejemplo: midominio.com.pe => partes: ["midominio","com","pe"]
-    // Queremos que root_domain sea "midominio.com.pe", sub_domain lo que queda a la izquierda.
-    $last2 = implode('.', array_slice($parts, -2)); // últimas 2 partes
-    $last3 = implode('.', array_slice($parts, -3)); // últimas 3 partes (por si hubiera sub-subdominios)
+    $last2 = implode('.', array_slice($parts, -2)); 
+    $last3 = implode('.', array_slice($parts, -3));
 
     // Determina cuántos "componentes" del final conforman el TLD
     $tldLength = 1; // Por defecto asumimos TLD de 1 nivel (ej: .com)
@@ -72,16 +70,12 @@ function parseDomain(string $fullDomain): array
         $tldLength = 2;
     }
 
-    // root_domain => unión de las partes "dominio + TLD".
-    // sub_domain  => el resto a la izquierda.
     $domainPartsCount = count($parts);
-    $rootDomainParts  = $domainPartsCount - $tldLength - 1; 
     // -1 más para incluir la parte inmediatamente anterior al TLD.
-    // Ej. si $tldLength=2, restamos 3 a count($parts).
+    $rootDomainParts  = $domainPartsCount - $tldLength - 1;
 
     // Evita casos raros donde no haya subdominio
     if ($rootDomainParts < 1) {
-        // Significa que no hay subdominio
         return [
             'root_domain' => $fullDomain,
             'sub_domain'  => '',
@@ -128,9 +122,9 @@ function run() {
     // Analiza dominio y subdominio
     $parsed = parseDomain($requestedDomain);
     $rootDomain = $parsed['root_domain'];   // p.e. midominio.com.pe
-    $fullDomain = $requestedDomain;         // p.e. sub1.midominio.com.pe (se usará para DNS)
+    $fullDomain = $requestedDomain;         // p.e. sub1.midominio.com.pe
 
-    // Validaciones mínimas de la cadena ingresada
+    // Validaciones mínimas
     if (!filter_var($rootDomain, FILTER_VALIDATE_DOMAIN)) {
         $errors[] = "Invalid domain.";
     }
@@ -151,13 +145,14 @@ function run() {
     }
 
     // Creamos el objeto Zone con el dominio completo (para mostrar registros DNS).
-    // Nota: Se le agrega un punto final por convención en ZoneFile.
     $zone = new Zone($fullDomain . ".");
     $zone->setDefaultTtl(3600);
 
     // WHOIS se hace al dominio raíz
-    // --------------------------------------
-    $whois = shell_exec("whois $rootDomain | grep -E 'Name Server|Registrar:|Domain Name:|Updated Date:|Creation Date:|Registrar IANA ID:Domain Status:|Reseller:'");
+    // Modificamos el grep para incluir los campos típicos de .cl 
+    $whois = shell_exec(
+        "whois $rootDomain | grep -E '(Name Server|Registrar|Domain Name|Updated Date|Creation Date|Registrar IANA ID|Domain Status|Reseller|domain:|registrar:|created:|expire:|status:)'"
+    );
     $whois = empty($whois) ? "" : trim($whois);
 
     if (empty($whois)) {
@@ -168,23 +163,29 @@ function run() {
         die();
     }
 
-    $whois = explode("\n", $whois);
-    foreach ($whois as $key => $record) {
-        $split = explode(":", trim($record));
-        $name = trim($split[0]);
-        $value = isset($split[1]) ? trim($split[1]) : "";
-        if ($name == "Name Server" || $name == "Domain Name") {
-            $value = strtolower($value);
+    // Parseamos en array
+    $whoisLines = explode("\n", $whois);
+    $whois = [];
+    foreach ($whoisLines as $line) {
+        $splitPos = strpos($line, ':');
+        if ($splitPos !== false) {
+            $name  = trim(substr($line, 0, $splitPos), " :\t\n\r\0\x0B");
+            $value = trim(substr($line, $splitPos + 1), " :\t\n\r\0\x0B");
+            // Convertir a minúsculas algunos valores si así lo deseas
+            if (in_array(strtolower($name), ['name server','domain name'])) {
+                $value = strtolower($value);
+            }
+            $whois[] = ["name" => $name, "value" => $value];
         }
-        $whois[$key] = ["name" => $name, "value" => $value];
     }
-    // Eliminamos duplicados en el array de WHOIS
+    // Eliminamos duplicados
     $whois = array_map("unserialize", array_unique(array_map("serialize", $whois)));
-    $col_name = array_column($whois, 'name');
+    // Re-ordenar por nombre y valor
+    $col_name  = array_column($whois, 'name');
     $col_value = array_column($whois, 'value');
     array_multisort($col_name, SORT_ASC, $col_value, SORT_ASC, $whois);
 
-    // IP Lookup del dominio completo (puede ser sub1.midominio.com.pe)
+    // IP Lookup del dominio completo
     $ips = explode("\n", trim(shell_exec("dig $fullDomain +short")));
     foreach ($ips as $ip) {
         if (empty($ip)) {
@@ -192,11 +193,10 @@ function run() {
         }
         $response = shell_exec("whois $ip | grep -E 'NetName:|Organization:|OrgName:'");
         $response = empty($response) ? "" : trim($response);
-        $ip_lookup["$ip"] = $response;
+        $ip_lookup[$ip] = $response;
     }
 
     // Verificamos registro por registro
-    // --------------------------------------
     $records_to_check = [
         ["a" => ""],
         ["a" => "*"],
@@ -267,6 +267,7 @@ function run() {
             continue;
         }
 
+        // SOA
         if ($type == "soa") {
             $record_value = explode(" ", $value);
             $setName = empty($name) ? "@" : $name;
@@ -285,6 +286,7 @@ function run() {
             continue;
         }
 
+        // NS
         if ($type == "ns") {
             $record_values = explode("\n", $value);
             foreach ($record_values as $record_value) {
@@ -306,6 +308,7 @@ function run() {
             }
         }
 
+        // A
         if ($type == "a") {
             $record_values = explode("\n", $value);
             if ($name == "*") {
@@ -320,6 +323,7 @@ function run() {
             }
         }
 
+        // CNAME
         if ($type == "cname") {
             if ($name == "*") {
                 $wildcard_cname = $value;
@@ -332,6 +336,7 @@ function run() {
             $zone->addResourceRecord($recordObj);
         }
 
+        // SRV
         if ($type == "srv") {
             $record_values = explode(" ", $value);
             if (count($record_values) != 4) {
@@ -349,6 +354,7 @@ function run() {
             $zone->addResourceRecord($recordObj);
         }
 
+        // MX
         if ($type == "mx") {
             $setName = empty($name) ? "@" : $name;
             $record_values = explode("\n", $value);
@@ -371,6 +377,7 @@ function run() {
             }
         }
 
+        // TXT
         if ($type == "txt") {
             $record_values = explode("\n", $value);
             $setName = empty($name) ? "@" : "$name";
@@ -378,7 +385,6 @@ function run() {
                 $recordObj = new ResourceRecord;
                 $recordObj->setName($setName);
                 $recordObj->setClass('IN');
-                // Eliminamos comillas que puedan venir de "dig"
                 $cleanValue = trim($record_value, '"');
                 $recordObj->setRdata(Factory::Txt($cleanValue, 0, 200));
                 $zone->addResourceRecord($recordObj);
@@ -392,8 +398,7 @@ function run() {
         ];
     }
 
-    // HTTP HEADERS del subdominio (o dominio completo) consultado
-    // -----------------------------------------------------------------
+    // HTTP HEADERS
     $response = shell_exec("curl -sLI $fullDomain | awk 'BEGIN{RS=\"\\r\\n\\r\\n\"}; END{print}'");
     $lines = explode("\n", trim($response));
     $http_headers = [];
@@ -442,7 +447,10 @@ run();
     <link href="https://cdn.jsdelivr.net/npm/vuetify@v3.7.6/dist/vuetify.min.css" rel="stylesheet">
     <link rel="icon" href="favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, minimal-ui">
+
+    <!-- Script de Fathom Analytics -->
     <script src="https://cdn.usefathom.com/script.js" data-spa="auto" data-site="YXQSEBLN" defer></script>
+
     <style>
     [v-cloak] > * {
         display:none;
@@ -474,7 +482,7 @@ run();
 
             <v-alert type="warning" v-for="error in response.errors" class="mb-3" v-html="error"></v-alert>
 
-            <v-row v-if="response.whois && response.whois != ''">
+            <v-row v-if="response.whois && response.whois.length > 0">
             <v-col md="5" cols="12">
                 <v-card variant="outlined" color="primary">
                     <v-card-title>Whois</v-card-title>
@@ -604,6 +612,7 @@ run();
     </v-app>
   </div>
   <script src="prism.js"></script>
+  <!-- Versión de producción de Vue -->
   <script src="https://cdn.jsdelivr.net/npm/vue@3.4.30/dist/vue.global.prod.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/vuetify@v3.6.10/dist/vuetify.min.js"></script>
   <script>
@@ -617,13 +626,14 @@ run();
                 domain: "",
                 loading: false,
                 snackbar: { show: false, message: "" },
-                response: { whois: "", errors: [], zone: "" }
+                // Fíjate que 'whois' en el JSON final ahora es un array (quitar comillas si lo deseas)
+                response: { whois: [], errors: [], zone: "" }
             }
         },
         methods: {
             lookupDomain() {
                 this.loading = true;
-                // Limpiamos algo básico de la URL en caso de que el usuario ponga http://...
+                // Limpiamos http:// o https:// si existe
                 let domainClean = this.domain.replace(/^https?:\/\//, '').replace(/\/+$/, '');
 
                 fetch("?domain=" + encodeURIComponent(domainClean))
@@ -636,8 +646,8 @@ run();
                         Prism.highlightAll()
                     })
                     .catch((err) => {
-                        this.loading = false
                         console.error(err)
+                        this.loading = false
                     });
             },
             downloadZone() {
