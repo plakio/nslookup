@@ -1,5 +1,6 @@
 {
     "require": {
-        "badcow/dns": "^4.2"
+        "badcow/dns": "^4.2",
+        "jeremykendall/php-domain-parser": "^6.0"
     }
 }
