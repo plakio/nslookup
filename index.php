@@ -2,23 +2,18 @@
 
 require_once 'vendor/autoload.php';
 
+// Importar Badcow DNS
 use Badcow\DNS\Zone;
 use Badcow\DNS\ResourceRecord;
 use Badcow\DNS\AlignedBuilder;
 use Badcow\DNS\Rdata\Factory;
+use Badcow\DNS\Classes;
 
-// Clases de php-domain-parser
-use Pdp\Rules;
-use Pdp\Cache;
-use Pdp\Manager;
-
-/**
- * Para suprimir advertencias obsoletas de PHP (por si Badcow DNS lanza alguna)
- */
 error_reporting(E_ALL & ~E_DEPRECATED);
 
 /**
- * Formatea los TXT que excedan 500 caracteres dividiéndolos en varias líneas.
+ * Formatea los registros TXT largos (más de 500 caracteres)
+ * y los divide en varias líneas en la zona DNS resultante.
  */
 function specialTxtFormatter(Badcow\DNS\Rdata\TXT $rdata, int $padding): string {
     if (strlen($rdata->getText()) <= 500) {
@@ -38,45 +33,61 @@ function specialTxtFormatter(Badcow\DNS\Rdata\TXT $rdata, int $padding): string 
 }
 
 /**
- * Extrae el dominio "registrable" (eTLD+1) usando php-domain-parser,
- * para usarlo en el WHOIS (ej: "sub.dominio.com.pe" => "dominio.com.pe")
+ * Obtiene el "dominio base" (registrable) de un subdominio,
+ * contemplando TLD compuestos como .com.pe, .com.mx, .co.uk, etc.
+ * (Versión manual SIN php-domain-parser)
  */
-function getBaseDomainUsingParser($fullDomain) {
-    // Quitar protocolos y slashes en caso de que el usuario ponga "http://"
+function getBaseDomain(string $fullDomain): string
+{
     $fullDomain = preg_replace('/^https?:\/\//i', '', $fullDomain);
     $fullDomain = explode('/', $fullDomain)[0];
     $fullDomain = trim($fullDomain);
+    $fullDomain = strtolower($fullDomain);
 
-    // Descargamos las reglas de la Public Suffix List (o usamos caché local)
-    $manager = new Manager(
-        new Cache(), // Usa caché en disco (/tmp) por defecto
-        null         // Usa la PSL oficial si no hay una local
-    );
-    $rules = $manager->getRules();
+    // Lista de TLD compuestos. Agrega lo que necesites.
+    $doubleTlds = [
+        'com.pe',
+        'com.mx',
+        'com.ar',
+        'com.co',
+        'co.uk',
+        'co.nz',
+        'co.jp',
+        // ...
+    ];
 
-    // Resolvemos el dominio y extraemos la parte registrable
-    $domainObj = $rules->resolve($fullDomain);
-    return $domainObj->getRegistrableDomain(); 
+    $parts = explode('.', $fullDomain);
+    if (count($parts) < 2) {
+        return $fullDomain;
+    }
+
+    $last2Labels = implode('.', array_slice($parts, -2));
+    if (in_array($last2Labels, $doubleTlds)) {
+        array_splice($parts, -2);
+        $domain = array_pop($parts);
+        return $domain . '.' . $last2Labels;
+    } else {
+        // TLD simple
+        $tld    = array_pop($parts);
+        $domain = array_pop($parts);
+        return $domain . '.' . $tld;
+    }
 }
 
 function run() {
-
-    // Si no se pasa el parámetro "domain", salimos
     if (! isset($_REQUEST['domain'])) {
         return;
     }
 
-    // Dominio (o subdominio) que ingresa el usuario
     $fullDomain = trim($_REQUEST['domain']);
-
     $errors = [];
     $ip_lookup = [];
     $dns_records = [];
 
-    // Verificamos que estén instalados los bins
-    $required_bins = ["whois", "dig", "host"];
+    // Verificamos si están instalados whois, dig y host
+    $required_bins = [ "whois", "dig", "host" ];
     foreach ($required_bins as $bin) {
-        $output     = null;
+        $output = null;
         $return_var = null;
         exec("command -v $bin", $output, $return_var);
         if ($return_var != 0) {
@@ -84,12 +95,12 @@ function run() {
         }
     }
 
-    // Validaciones básicas del dominio
+    // Validaciones del "dominio" ingresado
     if (! filter_var($fullDomain, FILTER_VALIDATE_DOMAIN)) {
         $errors[] = "Invalid domain.";
     }
-    if (filter_var($fullDomain, FILTER_VALIDATE_DOMAIN) && strpos($fullDomain, '.') === false) {
-        $errors[] = "Invalid domain.";
+    if (strpos($fullDomain, '.') === false) {
+        $errors[] = "Invalid domain (no dot found).";
     }
     if (strlen($fullDomain) < 4) {
         $errors[] = "No domain name is that short.";
@@ -102,13 +113,8 @@ function run() {
         die();
     }
 
-    // 1) Obtenemos el dominio base usando php-domain-parser
-    try {
-        $whoisDomain = getBaseDomainUsingParser($fullDomain);
-    } catch (\Exception $e) {
-        // Si ocurre algún error, por seguridad tomamos el fullDomain:
-        $whoisDomain = $fullDomain;
-    }
+    // 1) Obtenemos el dominio base usando nuestra función manual
+    $whoisDomain = getBaseDomain($fullDomain);
 
     // 2) WHOIS sobre el dominio base
     $whoisCmd = "whois $whoisDomain | grep -E 'Name Server|Registrar:|Domain Name:|Updated Date:|Creation Date:|Registrar IANA ID:Domain Status:|Reseller:'";
@@ -121,29 +127,28 @@ function run() {
         die();
     }
 
-    // Parseamos la salida del WHOIS en un array ordenado
-    $whois = explode("\n", $whois);
-    foreach ($whois as $key => $record) {
-        // Limitamos el explode a 2 partes para no romper valores con ":" dentro
-        $split = explode(":", trim($record), 2);
+    // Parse WHOIS en array
+    $whoisLines = explode("\n", $whois);
+    foreach ($whoisLines as $key => $line) {
+        $split = explode(":", trim($line), 2);
         $name  = trim($split[0]);
         $value = trim($split[1] ?? "");
-        if ($name == "Name Server" || $name == "Domain Name") {
+        if ($name === "Name Server" || $name === "Domain Name") {
             $value = strtolower($value);
         }
-        $whois[$key] = [ "name" => $name, "value" => $value ];
+        $whoisLines[$key] = [ "name" => $name, "value" => $value ];
     }
     // Eliminamos duplicados
-    $whois = array_map("unserialize", array_unique(array_map("serialize", $whois)));
-    $col_name  = array_column($whois, 'name');
-    $col_value = array_column($whois, 'value');
-    array_multisort($col_name, SORT_ASC, $col_value, SORT_ASC, $whois);
+    $whoisLines = array_map("unserialize", array_unique(array_map("serialize", $whoisLines)));
+    $col_name  = array_column($whoisLines, 'name');
+    $col_value = array_column($whoisLines, 'value');
+    array_multisort($col_name, SORT_ASC, $col_value, SORT_ASC, $whoisLines);
 
-    // 3) Creamos la zona DNS (se aplica al dominio o subdominio completo)
+    // 3) Creamos la zona DNS (sobre el subdominio o dominio completo)
     $zone = new Zone($fullDomain . ".");
     $zone->setDefaultTtl(3600);
 
-    // 4) IP lookup (sobre el dominio o subdominio completo)
+    // 4) IP lookup (sobre el fullDomain)
     $ips = explode("\n", trim(shell_exec("dig $fullDomain +short")));
     foreach ($ips as $ip) {
         if (empty($ip)) {
@@ -154,8 +159,7 @@ function run() {
         $ip_lookup[$ip] = $response;
     }
 
-    // 5) Búsqueda de registros DNS en el fullDomain
-    //    Ajusta esta lista según tus necesidades
+    // 5) Consulta de registros DNS
     $records_to_check = [
         [ "a"     => "" ],
         [ "a"     => "*" ],
@@ -202,37 +206,32 @@ function run() {
         [ "soa"   => "" ],
     ];
 
-    $wildcard_cname = "";
-    $wildcard_a     = "";
-
     foreach ($records_to_check as $record) {
         $type = key($record);
         $name = $record[$type];
+        $pre  = ($name !== "") ? ($name . ".") : "";
 
-        $pre  = !empty($name) ? "{$name}." : "";
-        // Obtenemos la salida principal
+        // Verificamos con dig y host
         $value = shell_exec("(host -t $type $pre$fullDomain | grep -q 'is an alias for') && echo \"\" || dig $pre$fullDomain $type +short | sort -n");
-
-        // Ajuste especial para los CNAME (usamos host y awk)
         if ($type == "cname") {
             $value = shell_exec("host -t $type $pre$fullDomain | grep 'alias for' | awk '{print \$NF}'");
         }
-        $value = empty($value) ? "" : trim($value);
+        $value = trim($value ?? "");
         if (empty($value)) {
             continue;
         }
 
-        // Manejo de SOA
+        // SOA
         if ($type == "soa") {
             $parts = explode(" ", $value);
             if (count($parts) >= 7) {
                 $setName = empty($name) ? "@" : $name;
-                $rr = new ResourceRecord;
+                $rr = new ResourceRecord();
                 $rr->setName($setName);
                 $rr->setRdata(
                     Factory::Soa(
-                        $parts[0], // primary name server
-                        $parts[1], // responsible person (email)
+                        $parts[0], // primary nameserver
+                        $parts[1], // responsible email
                         $parts[2], // serial
                         $parts[3], // refresh
                         $parts[4], // retry
@@ -245,45 +244,45 @@ function run() {
             continue;
         }
 
-        // Manejo de NS
+        // NS
         if ($type == "ns") {
-            $record_values = explode("\n", $value);
-            foreach ($record_values as $rv) {
+            $nsValues = explode("\n", $value);
+            foreach ($nsValues as $nsVal) {
                 $setName = empty($name) ? "@" : $name;
-                $rr = new ResourceRecord;
+                $rr = new ResourceRecord();
                 $rr->setName($setName);
-                $rr->setRdata(Factory::Ns($rv));
+                $rr->setRdata(Factory::Ns($nsVal));
                 $zone->addResourceRecord($rr);
             }
             $dns_records[] = [ "type" => $type, "name" => $name, "value" => $value ];
             continue;
         }
 
-        // Verificamos si es en realidad un CNAME cuando pedimos un A
+        // Verificar si es un CNAME cuando pedimos A
         if ($type == "a" && preg_match("/[a-z]/i", $value)) {
-            // Reevaluamos como cname
-            $type = "cname";
+            $type  = "cname";
             $value = shell_exec("dig $pre$fullDomain $type +short | sort -n");
-            $value = empty($value) ? "" : trim($value);
+            $value = trim($value ?? "");
             if (empty($value)) {
                 continue;
             }
         }
 
         if ($type == "a") {
-            $record_values = explode("\n", $value);
-            $setName       = empty($name) ? "@" : $name;
-            foreach ($record_values as $rv) {
-                $rr = new ResourceRecord;
+            $aValues = explode("\n", $value);
+            $setName = empty($name) ? "@" : $name;
+            foreach ($aValues as $aVal) {
+                $rr = new ResourceRecord();
                 $rr->setName($setName);
-                $rr->setRdata(Factory::A($rv));
+                $rr->setClass(Classes::IN);
+                $rr->setRdata(Factory::A($aVal));
                 $zone->addResourceRecord($rr);
             }
         }
 
         if ($type == "cname") {
             $setName = empty($name) ? $fullDomain : $name;
-            $rr = new ResourceRecord;
+            $rr = new ResourceRecord();
             $rr->setName($setName);
             $rr->setRdata(Factory::Cname($value));
             $zone->addResourceRecord($rr);
@@ -292,9 +291,8 @@ function run() {
         if ($type == "srv") {
             $srvParts = explode(" ", $value);
             if (count($srvParts) == 4) {
-                // priority, weight, port, target
                 $setName = empty($name) ? "@" : $name;
-                $rr = new ResourceRecord;
+                $rr = new ResourceRecord();
                 $rr->setName($setName);
                 $rr->setRdata(Factory::Srv($srvParts[0], $srvParts[1], $srvParts[2], $srvParts[3]));
                 $zone->addResourceRecord($rr);
@@ -302,20 +300,19 @@ function run() {
         }
 
         if ($type == "mx") {
-            $setName       = empty($name) ? "@" : $name;
-            $record_values = explode("\n", $value);
-            // Ordenar por prioridad
-            usort($record_values, function ($a, $b) {
+            $mxLines = explode("\n", $value);
+            usort($mxLines, function($a, $b) {
                 $a_value = explode(" ", $a);
                 $b_value = explode(" ", $b);
                 return (int)$a_value[0] - (int)$b_value[0];
             });
-            foreach ($record_values as $line) {
-                $mxParts = explode(" ", $line);
+            $setName = empty($name) ? "@" : $name;
+            foreach ($mxLines as $mxLine) {
+                $mxParts = explode(" ", $mxLine);
                 if (count($mxParts) == 2) {
                     $mx_priority = $mxParts[0];
                     $mx_value    = $mxParts[1];
-                    $rr = new ResourceRecord;
+                    $rr = new ResourceRecord();
                     $rr->setName($setName);
                     $rr->setRdata(Factory::Mx($mx_priority, $mx_value));
                     $zone->addResourceRecord($rr);
@@ -324,26 +321,24 @@ function run() {
         }
 
         if ($type == "txt") {
-            $record_values = explode("\n", $value);
-            $setName       = empty($name) ? "@" : $name;
-            foreach ($record_values as $rv) {
-                // Quitamos comillas si vienen
-                $txtVal = trim($rv, '"');
-                $rr = new ResourceRecord;
+            $txtLines = explode("\n", $value);
+            $setName  = empty($name) ? "@" : $name;
+            foreach ($txtLines as $txtVal) {
+                $txtVal = trim($txtVal, '"');
+                $rr = new ResourceRecord();
                 $rr->setName($setName);
-                $rr->setClass('IN');
+                $rr->setClass(Classes::IN);
                 $rr->setRdata(Factory::Txt($txtVal, 0, 200));
                 $zone->addResourceRecord($rr);
             }
         }
 
-        // Guardamos para el array final
         $dns_records[] = [ "type" => $type, "name" => $name, "value" => $value ];
     }
 
-    // 6) HTTP headers (se hacen sobre el fullDomain)
-    $response = shell_exec("curl -sLI $fullDomain | awk 'BEGIN{RS=\"\\r\\n\\r\\n\"}; END{print}'");
-    $lines    = explode("\n", trim($response));
+    // 6) HTTP headers (subdominio o dominio completo)
+    $curlResp = shell_exec("curl -sLI $fullDomain | awk 'BEGIN{RS=\"\\r\\n\\r\\n\"}; END{print}'");
+    $lines = explode("\n", trim($curlResp));
     $http_headers = [];
     foreach ($lines as $line) {
         $line = trim($line);
@@ -362,23 +357,22 @@ function run() {
         }
     }
 
-    // 7) Construcción final de la zona
+    // 7) Construimos la zona
     $builder = new AlignedBuilder();
     $builder->addRdataFormatter('TXT', 'specialTxtFormatter');
 
     // Respuesta final en JSON
     echo json_encode([
-        "whois"        => $whois,         // WHOIS del dominio base
-        "http_headers" => $http_headers,  // Headers del subdominio/dominio
-        "dns_records"  => $dns_records,   // DNS del subdominio/dominio
+        "whois"        => $whoisLines,    // WHOIS del dominio base
+        "http_headers" => $http_headers,  // Headers del fullDomain
+        "dns_records"  => $dns_records,   // DNS del fullDomain
         "ip_lookup"    => $ip_lookup,     // IP lookup
         "errors"       => [],
-        "zone"         => $builder->build($zone)
+        "zone"         => $builder->build($zone),
     ]);
     die();
 }
 
-// Ejecutamos la función principal
 run();
 
 ?>
@@ -410,13 +404,13 @@ run();
     <v-app>
       <v-main>
         <v-container>
-            <v-text-field 
-                variant="outlined" 
-                color="primary" 
-                label="Dominio o Subdominio" 
-                v-model="domain" 
-                spellcheck="false" 
-                @keydown.enter="lookupDomain()" 
+            <v-text-field
+                variant="outlined"
+                color="primary"
+                label="Dominio o Subdominio"
+                v-model="domain"
+                spellcheck="false"
+                @keydown.enter="lookupDomain()"
                 class="mt-5 mx-auto"
             >
                 <template v-slot:append-inner>
@@ -445,7 +439,7 @@ run();
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        <tr v-for='record in response.whois'>
+                                        <tr v-for="record in response.whois" :key="record.name + record.value">
                                             <td>{{ record.name }}</td>
                                             <td>{{ record.value }}</td>
                                         </tr>
@@ -458,7 +452,7 @@ run();
                     <v-card class="mt-5" variant="outlined" color="primary">
                         <v-card-title>IP information (subdominio o dominio)</v-card-title>
                         <v-card-text>
-                            <template v-for='(rows, ip) in response.ip_lookup'>
+                            <template v-for="(rows, ip) in response.ip_lookup" :key="ip">
                                 <div class="mt-3">Details for {{ ip }}</div>
                                 <v-table density="compact">
                                     <template v-slot:default>
@@ -469,9 +463,9 @@ run();
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            <tr v-for='row in rows.split("\n")'>
-                                                <td>{{ row.split(":")[0] }}</td>
-                                                <td>{{ row.split(":")[1] }}</td>
+                                            <tr v-for="row in rows.split('\n')" :key="row">
+                                                <td>{{ row.split(':')[0] }}</td>
+                                                <td>{{ row.split(':')[1] }}</td>
                                             </tr>
                                         </tbody>
                                     </template>
@@ -492,7 +486,7 @@ run();
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        <tr v-for='(value, key) in response.http_headers'>
+                                        <tr v-for="(value, key) in response.http_headers" :key="key">
                                             <td>{{ key }}</td>
                                             <td v-if="Array.isArray(value)">
                                                 <div v-for="(v, idx) in value" :key="idx">{{ v }}</div>
@@ -519,10 +513,13 @@ run();
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        <tr v-for="record in response.dns_records">
-                                            <td>{{ record.type }}</td>
-                                            <td>{{ record.name }}</td>
-                                            <td class="multiline">{{ record.value }}</td>
+                                        <tr
+                                            v-for="(rec, index) in response.dns_records"
+                                            :key="rec.type + rec.name + index"
+                                        >
+                                            <td>{{ rec.type }}</td>
+                                            <td>{{ rec.name }}</td>
+                                            <td class="multiline">{{ rec.value }}</td>
                                         </tr>
                                     </tbody>
                                 </template>
@@ -531,15 +528,24 @@ run();
                     </v-card>
 
                     <v-card class="mt-5" variant="flat">
-                        <v-btn size="small" @click="copyZone()" class="position-absolute right-0 mt-6" style="margin-right: 140px;">
+                        <v-btn
+                            size="small"
+                            @click="copyZone()"
+                            class="position-absolute right-0 mt-6"
+                            style="margin-right: 140px;"
+                        >
                             <v-icon left>mdi-content-copy</v-icon>
                         </v-btn>
-                        <v-btn size="small" @click="downloadZone()" class="position-absolute right-0 mt-6 mr-4">
+                        <v-btn
+                            size="small"
+                            @click="downloadZone()"
+                            class="position-absolute right-0 mt-6 mr-4"
+                        >
                             <v-icon left>mdi-download</v-icon>
                             Download
                         </v-btn>
                         <pre class="language-dns-zone-file text-body-2" style="border-radius:4px;border:0px">
-                            <code class="language-dns-zone-file">{{ response.zone }}</code>
+<code class="language-dns-zone-file">{{ response.zone }}</code>
                         </pre>
                         <a ref="download_zone" href="#"></a>
                     </v-card>
@@ -577,13 +583,12 @@ run();
             lookupDomain() {
                 this.loading = true;
                 fetch("?domain=" + encodeURIComponent(this.domain))
-                    .then( response => response.json() )
-                    .then( data => {
+                    .then(response => response.json())
+                    .then(data => {
                         this.loading = false;
                         this.response = data;
                     })
                     .then(() => {
-                        // Resaltar syntax con Prism
                         Prism.highlightAll();
                     })
                     .catch((error) => {
