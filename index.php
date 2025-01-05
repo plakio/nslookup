@@ -603,7 +603,7 @@ run();
     </v-app>
   </div>
   <script src="prism.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/vue@3.4.30/dist/vue.global.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/vue@3.4.30/dist/vue.global.prod.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/vuetify@v3.6.10/dist/vuetify.min.js"></script>
   <script>
     const { createApp } = Vue;
