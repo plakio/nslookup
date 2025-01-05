@@ -33,7 +33,7 @@ function specialTxtFormatter(Badcow\DNS\Rdata\TXT $rdata, int $padding): string 
  * Función para separar dominio raíz (root domain) y subdominio,
  * considerando TLDs comunes de dos niveles (ej: com.pe, com.mx, etc.).
  *
- * Por ejemplo:
+ * Ejemplos:
  *   - "sub1.midominio.com"       => ["root_domain" => "midominio.com",       "sub_domain" => "sub1"]
  *   - "sub2.midominio.com.pe"    => ["root_domain" => "midominio.com.pe",    "sub_domain" => "sub2"]
  *   - "midominio.com.pe"         => ["root_domain" => "midominio.com.pe",    "sub_domain" => ""]
@@ -122,7 +122,7 @@ function run() {
     // Analiza dominio y subdominio
     $parsed = parseDomain($requestedDomain);
     $rootDomain = $parsed['root_domain'];   // p.e. midominio.com.pe
-    $fullDomain = $requestedDomain;         // p.e. sub1.midominio.com.pe
+    $fullDomain = $requestedDomain;         // p.e. sub1.midominio.com.pe (para DNS)
 
     // Validaciones mínimas
     if (!filter_var($rootDomain, FILTER_VALIDATE_DOMAIN)) {
@@ -145,14 +145,26 @@ function run() {
     }
 
     // Creamos el objeto Zone con el dominio completo (para mostrar registros DNS).
+    // Nota: Se le agrega un punto final por convención en un ZoneFile.
     $zone = new Zone($fullDomain . ".");
     $zone->setDefaultTtl(3600);
 
     // WHOIS se hace al dominio raíz
-    // Modificamos el grep para incluir los campos típicos de .cl 
-    $whois = shell_exec(
-        "whois $rootDomain | grep -E '(Name Server|Registrar|Domain Name|Updated Date|Creation Date|Registrar IANA ID|Domain Status|Reseller|domain:|registrar:|created:|expire:|status:)'"
-    );
+    // -----------------------------------------------------------------
+    // Si termina en .cl, mostramos datos mínimos (domain:, registrar:, created:, expire:, status:)
+    // Si no, usamos el grep habitual
+    if (preg_match('/\.cl$/i', $rootDomain)) {
+        // SOLO para .cl
+        $whois = shell_exec(
+            "whois $rootDomain | grep -E '(domain:|registrar:|created:|expire:|status:)'"
+        );
+    } else {
+        // Resto de TLDs
+        $whois = shell_exec(
+            "whois $rootDomain | grep -E '(Name Server|Registrar:|Domain Name:|Updated Date:|Creation Date:|Registrar IANA ID|Domain Status:|Reseller:)'"
+        );
+    }
+
     $whois = empty($whois) ? "" : trim($whois);
 
     if (empty($whois)) {
@@ -163,29 +175,31 @@ function run() {
         die();
     }
 
-    // Parseamos en array
+    // Parseamos el WHOIS en array
     $whoisLines = explode("\n", $whois);
-    $whois = [];
+    $whoisData = [];
     foreach ($whoisLines as $line) {
         $splitPos = strpos($line, ':');
         if ($splitPos !== false) {
             $name  = trim(substr($line, 0, $splitPos), " :\t\n\r\0\x0B");
             $value = trim(substr($line, $splitPos + 1), " :\t\n\r\0\x0B");
-            // Convertir a minúsculas algunos valores si así lo deseas
+
+            // Opcional: si deseas mostrar en minúscula los Name Server o Domain Name
             if (in_array(strtolower($name), ['name server','domain name'])) {
                 $value = strtolower($value);
             }
-            $whois[] = ["name" => $name, "value" => $value];
+
+            $whoisData[] = ["name" => $name, "value" => $value];
         }
     }
     // Eliminamos duplicados
-    $whois = array_map("unserialize", array_unique(array_map("serialize", $whois)));
-    // Re-ordenar por nombre y valor
-    $col_name  = array_column($whois, 'name');
-    $col_value = array_column($whois, 'value');
-    array_multisort($col_name, SORT_ASC, $col_value, SORT_ASC, $whois);
+    $whoisData = array_map("unserialize", array_unique(array_map("serialize", $whoisData)));
+    // Re-ordenar por name y value
+    $col_name  = array_column($whoisData, 'name');
+    $col_value = array_column($whoisData, 'value');
+    array_multisort($col_name, SORT_ASC, $col_value, SORT_ASC, $whoisData);
 
-    // IP Lookup del dominio completo
+    // IP Lookup (para el dominio completo sub1.midominio.com.pe)
     $ips = explode("\n", trim(shell_exec("dig $fullDomain +short")));
     foreach ($ips as $ip) {
         if (empty($ip)) {
@@ -197,6 +211,7 @@ function run() {
     }
 
     // Verificamos registro por registro
+    // -----------------------------------------------------------------
     $records_to_check = [
         ["a" => ""],
         ["a" => "*"],
@@ -254,11 +269,11 @@ function run() {
             $pre = "{$name}.";
         }
 
-        // Usamos el dominio completo ($fullDomain) para las consultas DNS
+        // Usamos el dominio completo $fullDomain para las consultas DNS
         $value = shell_exec("(host -t $type $pre$fullDomain | grep -q 'is an alias for') && echo \"\" || dig $pre$fullDomain $type +short | sort -n");
         
-        // Para el caso de los CNAME, preferimos host
         if ($type == "cname") {
+            // Preferimos host
             $value = shell_exec("host -t $type $pre$fullDomain | grep 'alias for' | awk '{print \$NF}'");
         }
 
@@ -298,7 +313,7 @@ function run() {
             }
         }
 
-        // Verificar si A es CNAME
+        // Verificar si A es CNAME (si hay letras => probable alias)
         if ($type == "a" && preg_match("/[a-z]/i", $value)) {
             $type = "cname";
             $value = shell_exec("dig $pre$fullDomain $type +short | sort -n");
@@ -358,6 +373,7 @@ function run() {
         if ($type == "mx") {
             $setName = empty($name) ? "@" : $name;
             $record_values = explode("\n", $value);
+            // Ordenamos por prioridad
             usort($record_values, function ($a, $b) {
                 $a_value = explode(" ", $a);
                 $b_value = explode(" ", $b);
@@ -424,7 +440,8 @@ function run() {
     $builder->addRdataFormatter('TXT', 'specialTxtFormatter');
 
     echo json_encode([
-        "whois"        => $whois,
+        // Recuerda que $whoisData es el array con la info parseada
+        "whois"        => $whoisData,
         "http_headers" => $http_headers,
         "dns_records"  => $dns_records,
         "ip_lookup"    => $ip_lookup,
@@ -482,6 +499,7 @@ run();
 
             <v-alert type="warning" v-for="error in response.errors" class="mb-3" v-html="error"></v-alert>
 
+            <!-- Verificamos si hay contenido en response.whois y si es un array con longitud > 0 -->
             <v-row v-if="response.whois && response.whois.length > 0">
             <v-col md="5" cols="12">
                 <v-card variant="outlined" color="primary">
@@ -496,7 +514,8 @@ run();
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    <tr v-for='record in response.whois'>
+                                    <!-- Recorremos los pares name/value -->
+                                    <tr v-for="record in response.whois" :key="record.name + record.value">
                                         <td>{{ record.name }}</td>
                                         <td>{{ record.value }}</td>
                                     </tr>
@@ -520,7 +539,7 @@ run();
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        <tr v-for='row in rows.split("\n")'>
+                                        <tr v-for='row in rows.split("\n")' :key="row">
                                             <td>{{ row.split(":")[0] }}</td>
                                             <td>{{ row.split(":")[1] }}</td>
                                         </tr>
@@ -543,12 +562,12 @@ run();
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    <tr v-for='(value, key) in response.http_headers'>
+                                    <tr v-for='(value, key) in response.http_headers' :key="key">
                                         <td>{{ key }}</td>
                                         <td>
-                                            <!-- Si hay múltiples valores para la misma key, los mostramos en una lista -->
+                                            <!-- Si hay múltiples valores para la misma key, mostramos en una lista -->
                                             <div v-if="Array.isArray(value)">
-                                                <div v-for="val in value">{{ val }}</div>
+                                                <div v-for="(val, idx) in value" :key="idx">{{ val }}</div>
                                             </div>
                                             <div v-else>
                                                 {{ value }}
@@ -575,7 +594,7 @@ run();
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    <tr v-for="record in response.dns_records">
+                                    <tr v-for="(record, idx) in response.dns_records" :key="idx">
                                         <td>{{ record.type }}</td>
                                         <td>{{ record.name }}</td>
                                         <td class="multiline">{{ record.value }}</td>
@@ -611,10 +630,13 @@ run();
       </v-main>
     </v-app>
   </div>
+
+  <!-- Prism para resaltar sintaxis -->
   <script src="prism.js"></script>
-  <!-- Versión de producción de Vue -->
+  <!-- Vue y Vuetify (versión de producción) -->
   <script src="https://cdn.jsdelivr.net/npm/vue@3.4.30/dist/vue.global.prod.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/vuetify@v3.6.10/dist/vuetify.min.js"></script>
+
   <script>
     const { createApp } = Vue;
     const { createVuetify } = Vuetify;
@@ -626,7 +648,7 @@ run();
                 domain: "",
                 loading: false,
                 snackbar: { show: false, message: "" },
-                // Fíjate que 'whois' en el JSON final ahora es un array (quitar comillas si lo deseas)
+                // Ajustado: 'whois' ahora es un array en la respuesta
                 response: { whois: [], errors: [], zone: "" }
             }
         },
